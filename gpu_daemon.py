@@ -8,13 +8,8 @@ import threading
 import subprocess
 import psutil
 import random
-import math
 import logging
-from pathlib import Path
 
-# ─────────────────────────────────────────────
-# 日志配置
-# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -28,115 +23,84 @@ log = logging.getLogger('GPUDaemon')
 
 # ─────────────────────────────────────────────
 # 平滑随机游走器
-# 用于生成"有惯性"的随机值，避免尖峰
 # ─────────────────────────────────────────────
 class SmoothRandomWalker:
-    """
-    模拟带惯性的随机游走：
-    - current_value 缓慢向 target 靠近
-    - target 定期随机更新
-    - 在 current_value 附近叠加极小的高频抖动
-    """
-
-    def __init__(self, init_value, value_range, 
+    def __init__(self, init_value, value_range,
                  drift_speed=0.002, jitter_scale=0.008,
-                 target_update_interval=(30, 120)):
-        """
-        init_value:              初始值
-        value_range:             (min, max) 允许范围
-        drift_speed:             每次 step 向 target 靠近的比例（惯性）
-        jitter_scale:            叠加在当前值上的高频抖动幅度
-        target_update_interval:  多少秒后随机更新 target
-        """
+                 target_update_interval=(1800, 7200)):  # 默认30min~2h
         self.value = init_value
         self.value_range = value_range
         self.drift_speed = drift_speed
         self.jitter_scale = jitter_scale
         self.target_update_interval = target_update_interval
-
         self.target = init_value
         self.next_target_time = time.time() + random.uniform(*target_update_interval)
 
     def step(self):
-        """推进一步，返回当前值"""
         now = time.time()
-
-        # 到时间了就随机选一个新 target
         if now >= self.next_target_time:
             lo, hi = self.value_range
-            # target 在范围内随机，但偏向中间，避免长期贴边
             mid = (lo + hi) / 2
             spread = (hi - lo) / 2
             self.target = mid + random.gauss(0, spread * 0.5)
             self.target = max(lo, min(hi, self.target))
             self.next_target_time = now + random.uniform(*self.target_update_interval)
+            log.debug(f"Walker 新目标: {self.target:.3f}, "
+                      f"下次更新: {(self.next_target_time - now)/3600:.1f}h 后")
 
-        # 当前值向 target 缓慢靠近（指数平滑）
         self.value += (self.target - self.value) * self.drift_speed
-
-        # 叠加极小的高频抖动
         jitter = random.gauss(0, self.jitter_scale)
-        result = self.value + jitter
-
-        # 限制在范围内
         lo, hi = self.value_range
-        return max(lo, min(hi, result))
+        return max(lo, min(hi, self.value + jitter))
 
 
 # ─────────────────────────────────────────────
 # 单卡行为模拟器
 # ─────────────────────────────────────────────
 class CardBehaviorSimulator:
-    """
-    每张卡独立的行为状态机：
-    - 有若干"稳态阶段"，每个阶段有自己的利用率基线
-    - 阶段内利用率在基线附近平稳波动
-    - 阶段切换时利用率平滑过渡，不突变
-    """
 
-    # 各阶段的利用率基线范围和持续时间
     PHASES = [
         {
-            'name':        'training',       # 正常训练
-            'util_range':  (0.78, 0.92),     # 该阶段的利用率基线范围
-            'util_jitter': 0.015,            # 基线内的抖动幅度
-            'duration':    (120, 400),
+            'name':        'training',
+            'util_range':  (0.78, 0.92),
+            'util_jitter': 0.015,
+            'duration':    (1800, 7200),    # 0.5h ~ 2h
         },
         {
-            'name':        'evaluation',     # 验证推理，利用率略低
+            'name':        'evaluation',
             'util_range':  (0.55, 0.72),
             'util_jitter': 0.012,
-            'duration':    (20, 80),
+            'duration':    (600, 2400),     # 10min ~ 40min
         },
         {
-            'name':        'data_loading',   # 数据加载，GPU 等待
+            'name':        'data_loading',
             'util_range':  (0.08, 0.22),
             'util_jitter': 0.010,
-            'duration':    (5, 25),
+            'duration':    (120, 600),      # 2min ~ 10min
         },
         {
-            'name':        'gradient_sync',  # 多卡梯度同步
+            'name':        'gradient_sync',
             'util_range':  (0.25, 0.45),
             'util_jitter': 0.018,
-            'duration':    (3, 12),
+            'duration':    (60, 300),       # 1min ~ 5min
         },
         {
-            'name':        'checkpoint',     # 保存 checkpoint
+            'name':        'checkpoint',
             'util_range':  (0.03, 0.10),
             'util_jitter': 0.005,
-            'duration':    (4, 15),
+            'duration':    (120, 480),      # 2min ~ 8min
         },
         {
-            'name':        'warmup',         # 学习率 warmup
+            'name':        'warmup',
             'util_range':  (0.65, 0.82),
             'util_jitter': 0.020,
-            'duration':    (40, 150),
+            'duration':    (900, 3600),     # 15min ~ 1h
         },
         {
-            'name':        'pipeline_bubble', # 流水线气泡
+            'name':        'pipeline_bubble',
             'util_range':  (0.10, 0.28),
             'util_jitter': 0.012,
-            'duration':    (2, 8),
+            'duration':    (60, 300),       # 1min ~ 5min
         },
     ]
 
@@ -145,42 +109,34 @@ class CardBehaviorSimulator:
     def __init__(self, gpu_id, mem_range_base=(0.75, 0.88)):
         self.gpu_id = gpu_id
 
-        # 每张卡显存范围略有偏移
         offset = random.uniform(-0.04, 0.04)
         self.mem_range = (
             max(0.60, mem_range_base[0] + offset),
             min(0.93, mem_range_base[1] + offset),
         )
 
-        # 当前阶段
         self.current_phase = None
-        self.phase_end_time = 0
+        self.phase_end_time = time.time() - random.uniform(0, 600)
 
-        # 利用率平滑游走器（核心）
-        # 初始值随机，后续跟随阶段基线
         init_util = random.uniform(0.6, 0.9)
         self.util_walker = SmoothRandomWalker(
             init_value=init_util,
             value_range=(0.03, 0.98),
-            drift_speed=0.005,       # 较慢的漂移，保证平稳
-            jitter_scale=0.008,      # 极小抖动
-            target_update_interval=(20, 60),
+            drift_speed=0.003,
+            jitter_scale=0.008,
+            target_update_interval=(1800, 7200),
         )
 
-        # 显存平滑游走器
         init_mem = random.uniform(*self.mem_range)
         self.mem_walker = SmoothRandomWalker(
             init_value=init_mem,
             value_range=self.mem_range,
-            drift_speed=0.001,       # 显存变化更慢
+            drift_speed=0.001,
             jitter_scale=0.003,
-            target_update_interval=(120, 480),
+            target_update_interval=(3600, 14400),  # 1h ~ 4h
         )
 
-        # 初始时间错开
-        self.phase_end_time = time.time() - random.uniform(0, 60)
         self._pick_phase()
-
         log.info(f"[GPU {gpu_id}] 显存范围: "
                  f"{self.mem_range[0]*100:.1f}% ~ {self.mem_range[1]*100:.1f}%")
 
@@ -189,28 +145,23 @@ class CardBehaviorSimulator:
             self.PHASES, weights=self.PHASE_WEIGHTS, k=1
         )[0]
         duration = random.uniform(*self.current_phase['duration'])
-        duration += random.gauss(0, duration * 0.1)
-        duration = max(2, duration)
+        duration = max(60, duration)
         self.phase_end_time = time.time() + duration
 
-        # 切换阶段时，把 util_walker 的 target 更新到新阶段的基线范围内
-        # drift_speed 保证不会瞬间跳变，而是平滑过渡
         phase_util_target = random.uniform(*self.current_phase['util_range'])
         self.util_walker.target = phase_util_target
         self.util_walker.jitter_scale = self.current_phase['util_jitter']
 
-        log.debug(f"[GPU {self.gpu_id}] 阶段: {self.current_phase['name']}, "
-                  f"目标利用率: {phase_util_target*100:.1f}%, "
-                  f"持续: {duration:.0f}s")
+        log.info(f"[GPU {self.gpu_id}] 阶段切换: {self.current_phase['name']}, "
+                 f"目标利用率: {phase_util_target*100:.1f}%, "
+                 f"持续: {duration/3600:.2f}h")
 
     def get_util(self):
-        """获取当前利用率（0~1），平滑无尖峰"""
         if time.time() > self.phase_end_time:
             self._pick_phase()
         return self.util_walker.step()
 
     def get_mem_ratio(self):
-        """获取当前显存占比，缓慢漂移"""
         return self.mem_walker.step()
 
     def get_matrix_size(self):
@@ -224,21 +175,18 @@ class CardBehaviorSimulator:
 # ─────────────────────────────────────────────
 class SingleCardWorker:
 
-    # 计算循环的基础 tick 间隔（秒）
-    # 每个 tick 内根据目标利用率决定算多久、停多久
-    TICK = 0.05
+    # 每个控制周期长度（秒）
+    # 在这个周期内按目标利用率分配计算时间和休眠时间
+    # 周期不能太短，否则 GPU 来不及响应
+    TICK = 0.5
 
     def __init__(self, gpu_id, mem_range_base):
         self.gpu_id = gpu_id
         self.device = torch.device(f'cuda:{gpu_id}')
         self.simulator = CardBehaviorSimulator(gpu_id, mem_range_base)
-
         self.running = False
         self.mem_tensor = None
         self.threads = []
-
-        # 当前实际利用率目标（由 simulator 驱动，平滑更新）
-        self._target_util = 0.8
 
     def start(self):
         self.running = True
@@ -257,7 +205,6 @@ class SingleCardWorker:
         self.threads = [t_compute, t_mem]
         for t in self.threads:
             t.start()
-
         log.info(f"[GPU {self.gpu_id}] 工作器已启动")
 
     def stop(self):
@@ -300,113 +247,113 @@ class SingleCardWorker:
         torch.cuda.empty_cache()
 
     def _mem_adjust_loop(self):
-        """
-        显存调整：跟随 mem_walker 缓慢漂移
-        不再是定时大幅重分配，而是周期性微调
-        真正的大幅重分配概率很低
-        """
         last_ratio = self.simulator.get_mem_ratio()
-
         while self.running:
-            time.sleep(random.uniform(30, 60))  # 每 30~60s 检查一次
+            # 每 5~15 分钟检查一次
+            wait = random.uniform(300, 900)
+            for _ in range(int(wait)):
+                if not self.running:
+                    return
+                time.sleep(1)
+
             if not self.running:
                 return
 
             new_ratio = self.simulator.get_mem_ratio()
-            delta = abs(new_ratio - last_ratio)
-
-            # 变化超过 3% 才真正重新分配，避免频繁操作
-            if delta > 0.03:
+            if abs(new_ratio - last_ratio) > 0.03:
                 log.info(f"[GPU {self.gpu_id}] 显存调整: "
                          f"{last_ratio*100:.1f}% -> {new_ratio*100:.1f}%")
                 self._release_memory()
-                time.sleep(random.uniform(0.2, 1.0))
+                time.sleep(random.uniform(0.5, 2.0))
                 self._alloc_memory(new_ratio)
                 last_ratio = new_ratio
 
     # ──────────────────────────────────────────
-    # 计算负载（核心改动）
+    # 计算负载
     # ──────────────────────────────────────────
-    def _compute_loop(self):
-        """
-        基于固定 TICK 的占空比控制：
-        每个 TICK 内：
-          - 计算时间 = TICK * target_util
-          - 休眠时间 = TICK * (1 - target_util)
-        target_util 由 SmoothRandomWalker 驱动，平滑变化
-        → 利用率曲线表现为：有惯性的平稳段 + 缓慢漂移 + 极小抖动
-        """
-        sz = self.simulator.get_matrix_size()
+    def _make_compute_tensors(self, sz):
+        """创建用于计算的 tensor，确保在 GPU 上"""
         a = torch.randn(sz, sz, device=self.device)
         b = torch.randn(sz, sz, device=self.device)
+        # 预热，确保 CUDA context 已经建立
+        _ = torch.mm(a, b)
+        torch.cuda.synchronize(self.gpu_id)
+        return a, b
+
+    def _compute_loop(self):
+        """
+        固定 TICK 周期的占空比控制：
+        每个 TICK 内：
+          compute_time = TICK * target_util  → 持续做矩阵运算
+          sleep_time   = TICK * (1-target_util) → 休眠
+        关键：计算阶段用 busy loop 持续提交算子，
+              不能有任何 sleep，否则 GPU 会空转
+        """
+        sz = self.simulator.get_matrix_size()
+        a, b = self._make_compute_tensors(sz)
         last_resize = time.time()
         iter_count = 0
 
+        # 先做一次同步确认 GPU 正常
+        torch.cuda.synchronize(self.gpu_id)
+        log.info(f"[GPU {self.gpu_id}] 计算循环启动，矩阵: {sz}x{sz}")
+
         while self.running:
             try:
-                # 从 simulator 获取平滑后的目标利用率
                 target_util = self.simulator.get_util()
-
                 compute_time = self.TICK * target_util
                 sleep_time   = self.TICK * (1.0 - target_util)
 
-                # ── 计算阶段 ──────────────────────
+                # ── 计算阶段：busy loop，持续提交算子 ──
                 t_end = time.time() + compute_time
                 while time.time() < t_end:
-                    op = random.random()
-                    if op < 0.45:
-                        _ = torch.mm(a, b)
-                    elif op < 0.65:
-                        _ = torch.nn.functional.relu(a)
-                        _ = torch.mm(_, b)
-                    elif op < 0.80:
-                        _ = torch.nn.functional.softmax(a, dim=-1)
-                    elif op < 0.92:
-                        _ = (a * b).sum()
-                    else:
-                        _ = torch.nn.functional.layer_norm(
-                            a, a.shape[-1:]
-                        )
+                    # 连续提交多个算子，保证 GPU 持续有活干
+                    _ = torch.mm(a, b)
+                    _ = torch.mm(b, a)
+                    _ = torch.nn.functional.relu(a)
+                    _ = (a * b).sum()
+                    # 不加 synchronize，让算子在 GPU 上异步堆积执行
 
-                # ── 休眠阶段 ──────────────────────
-                if sleep_time > 0:
+                # 计算阶段结束时同步一次，确保 GPU 真正执行完
+                torch.cuda.synchronize(self.gpu_id)
+
+                # ── 休眠阶段 ──
+                if sleep_time > 1e-3:
                     time.sleep(sleep_time)
 
                 iter_count += 1
 
-                # 定期 resize 矩阵
-                if time.time() - last_resize > random.uniform(30, 120):
+                # 定期调整矩阵大小（模拟 batch size 变化）
+                if time.time() - last_resize > random.uniform(1800, 5400):
                     sz = self.simulator.get_matrix_size()
-                    a = torch.randn(sz, sz, device=self.device)
-                    b = torch.randn(sz, sz, device=self.device)
+                    a, b = self._make_compute_tensors(sz)
                     last_resize = time.time()
+                    log.info(f"[GPU {self.gpu_id}] 矩阵调整为 {sz}x{sz}")
 
-                # 随机 cuda sync（模拟真实训练的同步点）
-                if iter_count % random.randint(80, 250) == 0:
-                    torch.cuda.synchronize(self.gpu_id)
-
-                # 小概率触发较长 IO 等待（模拟磁盘读取）
-                # 注意：这里用 sleep 而不是停止计算，
-                # 让利用率有一段明显的低谷，而不是尖峰
-                if random.random() < 0.001:
-                    io_wait = random.uniform(1.0, 5.0)
-                    log.debug(f"[GPU {self.gpu_id}] IO等待 {io_wait:.1f}s")
-                    # 在 IO 等待期间，把 target 临时压低
+                # 小概率触发 IO 等待低谷（持续一段时间，不是尖峰）
+                if random.random() < 0.0005:
+                    io_wait = random.uniform(60, 300)  # 1~5 分钟的低谷
+                    log.info(f"[GPU {self.gpu_id}] IO等待低谷 {io_wait:.0f}s")
                     self.simulator.util_walker.target = random.uniform(0.05, 0.15)
-                    time.sleep(io_wait)
-                    # IO 结束后恢复到当前阶段的正常范围
+                    # 分段等待，方便响应停止信号
+                    for _ in range(int(io_wait)):
+                        if not self.running:
+                            return
+                        time.sleep(1)
+                    # 恢复
                     phase_util = random.uniform(
                         *self.simulator.current_phase['util_range']
                     )
                     self.simulator.util_walker.target = phase_util
+                    log.info(f"[GPU {self.gpu_id}] IO等待结束，恢复利用率")
 
             except Exception as e:
-                log.warning(f"[GPU {self.gpu_id}] 计算异常: {e}")
-                time.sleep(1)
+                log.warning(f"[GPU {self.gpu_id}] 计算异常: {e}", exc_info=True)
+                time.sleep(2)
 
 
 # ─────────────────────────────────────────────
-# 主守护进程（与之前相同，无改动）
+# 主守护进程
 # ─────────────────────────────────────────────
 class GPUDaemon:
 
@@ -446,9 +393,7 @@ class GPUDaemon:
             for line in uuid_out.split('\n'):
                 if line.strip():
                     parts = line.split(',')
-                    idx = int(parts[0].strip())
-                    uuid = parts[1].strip()
-                    uuid_to_id[uuid] = idx
+                    uuid_to_id[parts[1].strip()] = int(parts[0].strip())
 
             for line in out.split('\n'):
                 if not line.strip():
@@ -456,23 +401,19 @@ class GPUDaemon:
                 parts = line.split(',')
                 if len(parts) < 3:
                     continue
-                uuid = parts[0].strip()
-                pid = int(parts[1].strip())
+                gpu_id = uuid_to_id.get(parts[0].strip())
+                pid    = int(parts[1].strip())
                 mem_mb = int(parts[2].strip())
-                gpu_id = uuid_to_id.get(uuid)
                 if gpu_id in result_map and pid != os.getpid():
-                    result_map[gpu_id].append(
-                        {'pid': pid, 'memory_mb': mem_mb}
-                    )
+                    result_map[gpu_id].append({'pid': pid, 'memory_mb': mem_mb})
         except Exception as e:
             log.warning(f"nvidia-smi 查询失败: {e}")
         return result_map
 
     def _get_busy_gpus(self):
         threshold = self.config.get('min_real_memory_mb', 500)
-        proc_map = self._query_gpu_processes()
         busy = set()
-        for gpu_id, procs in proc_map.items():
+        for gpu_id, procs in self._query_gpu_processes().items():
             for p in procs:
                 if p['memory_mb'] > threshold:
                     try:
@@ -522,13 +463,13 @@ class GPUDaemon:
 
         check_range = self.config.get('check_interval_range', (4, 8))
 
-        # 错开各卡初始化时间
-        for gpu_id in self.config['gpu_ids']:
-            delay = random.uniform(0, 3)
+        # 错开各卡初始化，每张卡间隔 1~3s
+        for i, gpu_id in enumerate(self.config['gpu_ids']):
+            delay = i * random.uniform(1, 3)
             log.info(f"[GPU {gpu_id}] 将在 {delay:.1f}s 后初始化")
             threading.Timer(delay, self._start_worker, args=(gpu_id,)).start()
 
-        time.sleep(5)
+        time.sleep(len(self.config['gpu_ids']) * 3 + 5)
 
         while self.running:
             try:
@@ -551,8 +492,7 @@ class GPUDaemon:
                         delay, self._start_worker, args=(gpu_id,)
                     ).start()
 
-                interval = random.uniform(*check_range)
-                time.sleep(interval)
+                time.sleep(random.uniform(*check_range))
 
             except Exception as e:
                 log.error(f"主循环异常: {e}", exc_info=True)
@@ -579,5 +519,4 @@ if __name__ == '__main__':
         'min_real_memory_mb':   args.threshold_mb,
     }
 
-    daemon = GPUDaemon(config)
-    daemon.run()
+    GPUDaemon(config).run()
